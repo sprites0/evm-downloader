@@ -1,0 +1,21 @@
+[package]
+name = "super-fast-s3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aws-sdk-s3 = "1.93.0"
+aws-config = "1.8.0"
+tokio = { version = "1.44", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tar = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
+futures = "0.3"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+alloy-provider = { version = "1.0.37", features = ["reqwest"] }
+alloy-transport-http = "1.0.37"
+alloy-rpc-types = "1.0.37"
+indicatif = "0.17"
+num_cpus = "1.16"
