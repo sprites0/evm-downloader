@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -7,6 +8,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tar::Archive;
+
+/// Verify receipt integrity in blockchain data archives
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Input directory containing tar.zst files
+    #[arg(short, long, default_value = "blocks")]
+    input_dir: PathBuf,
+}
 
 #[derive(Debug, Deserialize)]
 struct BlockData {
@@ -31,10 +41,11 @@ struct Stats {
 }
 
 fn main() -> Result<()> {
-    let blocks_dir = PathBuf::from("blocks");
+    let args = Args::parse();
+    let blocks_dir = args.input_dir;
 
     if !blocks_dir.exists() {
-        anyhow::bail!("blocks/ directory not found");
+        anyhow::bail!("Input directory '{}' not found", blocks_dir.display());
     }
 
     // Collect all tar.zst files
