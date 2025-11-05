@@ -25,7 +25,9 @@ struct Stats {
     total_system_txs: AtomicU64,
     blocks_with_system_txs: AtomicU64,
     null_receipts: AtomicU64,
+    corrupted_blocks: AtomicU64,
     failed_blocks: Mutex<Vec<String>>,
+    corrupted_block_list: Mutex<Vec<String>>,
 }
 
 fn main() -> Result<()> {
@@ -66,11 +68,8 @@ fn main() -> Result<()> {
 
     // Process files in parallel
     tar_files.par_iter().for_each(|tar_file| {
-        match process_tar_file(tar_file, &stats) {
-            Ok(_) => {},
-            Err(e) => {
-                pb.println(format!("❌ Error processing {}: {}", tar_file.display(), e));
-            }
+        if let Err(e) = process_tar_file(tar_file, &stats) {
+            pb.println(format!("⚠️  Error processing {}: {}", tar_file.display(), e));
         }
         pb.inc(1);
     });
@@ -82,13 +81,23 @@ fn main() -> Result<()> {
     let total_system_txs = stats.total_system_txs.load(Ordering::Relaxed);
     let blocks_with_system_txs = stats.blocks_with_system_txs.load(Ordering::Relaxed);
     let null_receipts = stats.null_receipts.load(Ordering::Relaxed);
+    let corrupted_blocks = stats.corrupted_blocks.load(Ordering::Relaxed);
     let failed_blocks = stats.failed_blocks.lock().unwrap();
+    let corrupted_block_list = stats.corrupted_block_list.lock().unwrap();
 
     println!("\n=== VERIFICATION RESULTS ===");
     println!("Total blocks verified:         {}", total_blocks);
     println!("Blocks with system_txs:        {}", blocks_with_system_txs);
     println!("Total system_txs found:        {}", total_system_txs);
     println!("System_txs with null receipts: {}", null_receipts);
+    println!("Corrupted/unreadable blocks:   {}", corrupted_blocks);
+
+    if !corrupted_block_list.is_empty() {
+        println!("\n⚠️  Corrupted blocks ({}):", corrupted_block_list.len());
+        for block_path in corrupted_block_list.iter() {
+            println!("  {}", block_path);
+        }
+    }
 
     if !failed_blocks.is_empty() {
         println!("\n⚠️  Blocks with null receipts ({}):", failed_blocks.len());
@@ -107,10 +116,15 @@ fn process_tar_file(tar_file: &PathBuf, stats: &Stats) -> Result<()> {
     let file = std::fs::File::open(tar_file)
         .context(format!("Failed to open {}", tar_file.display()))?;
 
-    let zstd_decoder = zstd::stream::read::Decoder::new(file)
+    // Decompress the entire zstd file at once
+    let mut zstd_decoder = zstd::stream::read::Decoder::new(file)
         .context("Failed to create zstd decoder")?;
+    let mut decompressed_tar = Vec::new();
+    zstd_decoder.read_to_end(&mut decompressed_tar)
+        .context("Failed to decompress zstd")?;
 
-    let mut archive = Archive::new(zstd_decoder);
+    // Now read the tar archive from the decompressed data
+    let mut archive = Archive::new(&decompressed_tar[..]);
 
     for entry in archive.entries().context("Failed to read archive entries")? {
         let mut entry = entry.context("Failed to read entry")?;
@@ -127,19 +141,30 @@ fn process_tar_file(tar_file: &PathBuf, stats: &Stats) -> Result<()> {
 
         // Read compressed data
         let mut compressed_data = Vec::new();
-        entry.read_to_end(&mut compressed_data)
-            .context(format!("Failed to read {} from tar", path))?;
+        if let Err(e) = entry.read_to_end(&mut compressed_data) {
+            stats.corrupted_blocks.fetch_add(1, Ordering::Relaxed);
+            stats.corrupted_block_list.lock().unwrap().push(format!("{} (read error: {})", path, e));
+            continue;
+        }
 
         // Decompress lz4 frame format
-        let mut decoder = lz4::Decoder::new(&compressed_data[..])
-            .context(format!("Failed to create lz4 decoder for {}", path))?;
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(&compressed_data[..]);
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)
-            .context(format!("Failed to decompress lz4 for {}", path))?;
+        if let Err(e) = decoder.read_to_end(&mut decompressed) {
+            stats.corrupted_blocks.fetch_add(1, Ordering::Relaxed);
+            stats.corrupted_block_list.lock().unwrap().push(format!("{} (lz4 error: {})", path, e));
+            continue;
+        }
 
         // Deserialize msgpack - it's a list with one element
-        let blocks: Vec<BlockData> = rmp_serde::from_slice(&decompressed)
-            .context(format!("Failed to deserialize msgpack for {}", path))?;
+        let blocks: Vec<BlockData> = match rmp_serde::from_slice(&decompressed) {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                stats.corrupted_blocks.fetch_add(1, Ordering::Relaxed);
+                stats.corrupted_block_list.lock().unwrap().push(format!("{} (msgpack error: {})", path, e));
+                continue;
+            }
+        };
 
         if blocks.is_empty() {
             continue;
