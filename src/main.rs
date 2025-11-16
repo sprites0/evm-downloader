@@ -182,11 +182,6 @@ async fn main() -> Result<()> {
         skipped_blocks
     );
 
-    if chunks_to_download.is_empty() {
-        info!("All chunks already downloaded!");
-        return Ok(());
-    }
-
     // Create progress bar for total blocks to download
     let pb = ProgressBar::new(blocks_to_download);
     pb.set_style(
@@ -265,9 +260,9 @@ async fn main() -> Result<()> {
     );
 
     // Merge all chunks into unified evm-blocks.tar.zst
-    info!("Merging all chunks into unified evm-blocks.tar.zst...");
+    info!("Merging all chunks into unified evm-blocks-{}~{}.tar.zst...", args.start_block, end_block);
     let completed_dir = args.output_dir.join(".completed");
-    merge_chunks_to_unified(&args.output_dir, &completed_dir, args.compression_level).await?;
+    merge_chunks_to_unified(&args.output_dir, &completed_dir, args.compression_level, args.start_block, end_block).await?;
 
     Ok(())
 }
@@ -389,8 +384,10 @@ async fn merge_chunks_to_unified(
     output_dir: &PathBuf,
     completed_dir: &PathBuf,
     compression_level: i32,
+    start_block: u64,
+    end_block: u64,
 ) -> Result<()> {
-    // Find all chunk files (both .completed and .partial markers)
+    // Find all chunk files (both .completed and .partial markers) within the block range
     let mut chunk_files = Vec::new();
 
     for entry in std::fs::read_dir(completed_dir).context("Failed to read .completed directory")? {
@@ -406,9 +403,18 @@ async fn merge_chunks_to_unified(
         };
 
         if let Ok(chunk_id) = chunk_id {
-            let chunk_file = output_dir.join(format!("{}.tar.zst", chunk_id));
-            if chunk_file.exists() {
-                chunk_files.push((chunk_id, chunk_file));
+            // Check if this chunk overlaps with our desired block range
+            // chunk_id represents the start of a 1000-block range
+            // Chunk contains blocks from (chunk_id + 1) to (chunk_id + 1000)
+            let chunk_start = chunk_id + 1;
+            let chunk_end = chunk_id + 1000;
+
+            // Include chunk if it overlaps with [start_block, end_block]
+            if chunk_start <= end_block && chunk_end >= start_block {
+                let chunk_file = output_dir.join(format!("{}.tar.zst", chunk_id));
+                if chunk_file.exists() {
+                    chunk_files.push((chunk_id, chunk_file));
+                }
             }
         }
     }
@@ -424,8 +430,8 @@ async fn merge_chunks_to_unified(
     }
 
     // Create unified tar.zst file first
-    let unified_path = output_dir.join("evm-blocks.tar.zst");
-    info!("Creating unified evm-blocks.tar.zst...");
+    let unified_path = output_dir.join(format!("evm-blocks-{}~{}.tar.zst", start_block, end_block));
+    info!("Creating unified evm-blocks-{}~{}.tar.zst...", start_block, end_block);
 
     let output_file = std::fs::File::create(&unified_path)
         .context(format!("Failed to create unified file: {}", unified_path.display()))?;
@@ -454,16 +460,22 @@ async fn merge_chunks_to_unified(
             extract_blocks_from_chunk(&chunk_file)
         }).await.context("Extraction task failed")??;
 
+        // Filter blocks to only include those in the desired range
         // Blocks within each chunk are already sorted by block_num (from write_chunk)
-        // Write them directly to the unified archive
         for block in blocks {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(block.data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
+            // Extract block number from path (format: {f}/{s}/{height}.rmp.lz4)
+            if let Some(block_num) = extract_block_num_from_path(&block.path) {
+                // Only include blocks within the requested range
+                if block_num >= start_block && block_num <= end_block {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(block.data.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
 
-            tar_builder.append_data(&mut header, &block.path, block.data.as_slice())
-                .context(format!("Failed to add {} to unified tar", block.path))?;
+                    tar_builder.append_data(&mut header, &block.path, block.data.as_slice())
+                        .context(format!("Failed to add {} to unified tar", block.path))?;
+                }
+            }
         }
 
         pb.inc(1);
@@ -481,6 +493,16 @@ async fn merge_chunks_to_unified(
     info!("Successfully created unified archive: {}", unified_path.display());
 
     Ok(())
+}
+
+/// Extract block number from path (format: {f}/{s}/{height}.rmp.lz4)
+fn extract_block_num_from_path(path: &str) -> Option<u64> {
+    // Get the filename from the path (last component)
+    let filename = path.split('/').last()?;
+    // Remove the .rmp.lz4 extension
+    let block_str = filename.strip_suffix(".rmp.lz4")?;
+    // Parse as u64
+    block_str.parse::<u64>().ok()
 }
 
 fn extract_blocks_from_chunk(chunk_file: &PathBuf) -> Result<Vec<ExtractedBlock>> {
